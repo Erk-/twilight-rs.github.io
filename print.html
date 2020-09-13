@@ -191,47 +191,81 @@ giving you a tailored experience.</p>
 <h2><a class="header" href="#a-quick-example" id="a-quick-example">A Quick Example</a></h2>
 <p>Below is a quick example of a program printing &quot;Pong!&quot; when a ping command comes
 in from a channel:</p>
-<pre><pre class="playground"><code class="language-rust edition2018">use futures::StreamExt;
-use twilight::{
-    command_parser::{Command, Config as ParserConfig, Parser},
-    gateway::{Config, Event, Shard},
-};
-use std::{
-    env,
-    error::Error,
-};
+<pre><pre class="playground"><code class="language-rust edition2018">use std::{env, error::Error};
+use tokio::stream::StreamExt;
+use twilight_cache_inmemory::{EventType, InMemoryCache};
+use twilight_gateway::{cluster::{Cluster, ShardScheme}, Event};
+use twilight_http::Client as HttpClient;
+use twilight_model::gateway::GatewayIntents;
 
 #[tokio::main]
-async fn main() -&gt; Result&lt;(), Box&lt;dyn Error&gt;&gt; {
+async fn main() -&gt; Result&lt;(), Box&lt;dyn Error + Send + Sync&gt;&gt; {
     let token = env::var(&quot;DISCORD_TOKEN&quot;)?;
 
-    // Create a shard, which is the driver for an event loop over incoming
-    // events and sending events.
-    let mut shard = Shard::new(env::var(&quot;DISCORD_TOKEN&quot;)?);
-    // Retrieve a new asynchronous stream of the events that the shard will
-    // receive.
-    let mut events = shard.events();
+    // This is also the default.
+    let scheme = ShardScheme::Auto;
 
-    let parser = {
-        let mut config = Config::new();
-        config.command(&quot;ping&quot;).add();
-        config.add_prefix(&quot;!&quot;);
-        Parser::new(config)
-    };
+    let cluster = Cluster::builder(&amp;token)
+        .shard_scheme(scheme)
+        // Use intents to only listen to GUILD_MESSAGES events
+        .intents(Some(
+            GatewayIntents::GUILD_MESSAGES | GatewayIntents::DIRECT_MESSAGES,
+        ))
+        .build()
+        .await?;
 
-    // Start the shard to begin receiving events.
-    shard.start().await?;
+    // Start up the cluster
+    let cluster_spawn = cluster.clone();
 
-    while let Some(event) = events.next().await {
-        match event {
-            Event::MessageCreate(msg) =&gt; match parser.parse(&amp;msg.content) {
-                Command { name: &quot;ping&quot;, .. } =&gt; println!(&quot;Pong!&quot;),
-                _ =&gt; {},
-            },
-            // More events here...
-            _ =&gt; {},
-        }
+    tokio::spawn(async move {
+        cluster_spawn.up().await;
+    });
+
+    // The http client is seperate from the gateway,
+    // so startup a new one
+    let http = HttpClient::new(&amp;token);
+
+    // Since we only care about messages, make the cache only
+    // cache message related events
+    let cache = InMemoryCache::builder()
+        .event_types(
+            EventType::MESSAGE_CREATE
+                | EventType::MESSAGE_DELETE
+                | EventType::MESSAGE_DELETE_BULK
+                | EventType::MESSAGE_UPDATE,
+        )
+        .build();
+
+    let mut events = cluster.events();
+    // Startup an event loop to process each event in the event stream as they
+    // come in.
+    while let Some((shard_id, event)) = events.next().await {
+        // Update the cache.
+        cache.update(&amp;event);
+
+        // Spawn a new task to handle the event
+        tokio::spawn(handle_event(shard_id, event, http.clone()));
     }
+
+    Ok(())
+}
+
+async fn handle_event(
+    shard_id: u64,
+    event: Event,
+    http: HttpClient,
+) -&gt; Result&lt;(), Box&lt;dyn Error + Send + Sync&gt;&gt; {
+    match event {
+        Event::MessageCreate(msg) if msg.content == &quot;!ping&quot; =&gt; {
+            http.create_message(msg.channel_id).content(&quot;Pong!&quot;)?.await?;
+        }
+        Event::ShardConnected(_) =&gt; {
+            println!(&quot;Connected on shard {}&quot;, shard_id);
+        }
+        _ =&gt; {}
+    }
+
+    Ok(())
 }
 </code></pre></pre>
 <h1><a class="header" href="#support" id="support">Support</a></h1>
@@ -270,7 +304,7 @@ of them. Most of them wrap Discord's various APIs.</p>
 <li><a href="chapter_1_crates/./section_2_http.html">http</a>: HTTP client supporting all of the documented features of Discord's
 HTTP API, with support for ratelimiting, proxying, and more.</li>
 <li><a href="chapter_1_crates/./section_3_gateway.html">gateway</a>: Clients supporting Discord's gateway API.</li>
-<li><a href="chapter_1_crates/./section_4_cache.html">cache</a>: Definitions for implementating a cache. An in-process memory
+<li><a href="chapter_1_crates/./section_4_cache_inmemory.html">cache</a>: Definitions for implementating a cache. An in-process memory
 implementation is included.</li>
 <li><a href="chapter_1_crates/./section_5_command_parser.html">command-parser</a>: Basic command parser for parsing commands and arguments
 out of messages.</li>
@@ -327,7 +361,7 @@ but it can be changed to use NativeTLS which uses the TLS native to the platform
 <p>Ratelimiting is included out-of-the-box, along with support for proxies.</p>
 <h2><a class="header" href="#installation-1" id="installation-1">Installation</a></h2>
 <p>Add the following to your <code>Cargo.toml</code>:</p>
-<pre><code class="language-toml">twilight-http = { git = &quot;https://github.com/twilight-rs/twilight&quot; }
+<pre><code class="language-toml">twilight-http = { branch = &quot;trunk&quot;, git = &quot;https://github.com/twilight-rs/twilight&quot; }
 </code></pre>
 <h2><a class="header" href="#example" id="example">Example</a></h2>
 <p>A quick example showing how to send 10 messages, and then print the current
@@ -796,8 +830,8 @@ it's flexible enough to do anything you need, and if you find something it can't
 then we'll fix it. The goal is to remove all limitations on designs and allow
 you to do what you need.</p>
 <h1><a class="header" href="#bots-using-twilight" id="bots-using-twilight">Bots using Twilight</a></h1>
-<p>Below is a list of bots known to be using the Twilight ecosystem. The use could be
-as small as only <a href="./chapter_1_crates/section_3_gateway.html">the gateway</a> or <a href="./chapter_3_services/section_2_using_http_proxy.html">HTTP proxy</a>, or as large as all of the
+<p>Below is a list of bots known to be using the Twilight ecosystem. The use could
+be as small as only <a href="./chapter_1_crates/section_3_gateway.html">the gateway</a> or <a href="./chapter_1_crates/section_2_http.html">HTTP client</a>, or as large as all of the
 <a href="./chapter_1_crates/summary.html">core crates</a>.</p>
 <p>Want your bot added? Feel free to send a PR to the <a href="https://github.com/twilight-rs/twilight-rs.github.io">repo</a>!</p>
 <h2><a class="header" href="#gearbot" id="gearbot">Gearbot</a></h2>
